@@ -37,8 +37,9 @@ class HttpOutboundConnection : public HttpConnection {
     td::Promise<std::pair<std::unique_ptr<HttpResponse>, std::shared_ptr<HttpPayload>>> promise;
   };
 
-  HttpOutboundConnection(td::SocketFd fd, std::shared_ptr<HttpClient::Callback> http_callback)
-      : HttpConnection(std::move(fd), nullptr, false), http_callback_(std::move(http_callback)) {
+  HttpOutboundConnection(td::SocketFd fd, std::shared_ptr<HttpClient::Callback> http_callback,
+                        HttpBufferOptions buffer_options = {})
+      : HttpConnection(std::move(fd), nullptr, false, buffer_options), http_callback_(std::move(http_callback)) {
   }
 
   td::Status receive_eof() override {

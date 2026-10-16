@@ -44,17 +44,18 @@ class HttpServer : public td::actor::Actor {
     }
   };
 
-  HttpServer(td::IPAddress address, std::shared_ptr<Callback> callback);
+  HttpServer(td::IPAddress address, std::shared_ptr<Callback> callback, HttpBufferOptions buffer_options = {});
 
-  HttpServer(td::uint16 port, std::shared_ptr<Callback> callback)
-      : HttpServer(make_any_address(port), std::move(callback)) {
+  HttpServer(td::uint16 port, std::shared_ptr<Callback> callback, HttpBufferOptions buffer_options = {})
+      : HttpServer(make_any_address(port), std::move(callback), buffer_options) {
   }
 
   void start_up() override;
   void accepted(td::SocketFd fd);
 
-  static td::actor::ActorOwn<HttpServer> create(td::uint16 port, std::shared_ptr<Callback> callback) {
-    return td::actor::create_actor<HttpServer>("httpserver", port, std::move(callback));
+  static td::actor::ActorOwn<HttpServer> create(td::uint16 port, std::shared_ptr<Callback> callback,
+                                                 HttpBufferOptions buffer_options = {}) {
+    return td::actor::create_actor<HttpServer>("httpserver", port, std::move(callback), buffer_options);
   }
 
   td::actor::Task<> collect(metrics::Context ctx) {
@@ -85,6 +86,7 @@ class HttpServer : public td::actor::Actor {
 
   td::IPAddress address_;
   std::shared_ptr<Callback> callback_;
+  HttpBufferOptions buffer_options_;
 
   td::actor::ActorOwn<td::TcpInfiniteListener> listener_;
 

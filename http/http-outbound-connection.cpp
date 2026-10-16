@@ -55,7 +55,7 @@ td::Status HttpOutboundConnection::receive(td::ChainBufferReader &input) {
 
   close_after_read_ = !cur_response_->keep_alive() || !keep_alive_;
 
-  auto payload = cur_response_->create_empty_payload().move_as_ok();
+  auto payload = cur_response_->create_empty_payload(buffer_options_.payload_high_watermark).move_as_ok();
   promise_.set_value(std::make_pair(std::move(cur_response_), payload));
   read_payload(std::move(payload));
 

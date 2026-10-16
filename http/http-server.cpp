@@ -52,8 +52,8 @@ class HttpServer::StatsCountingCallback : public HttpServer::Callback {
   std::shared_ptr<Callback> callback_;
 };
 
-HttpServer::HttpServer(td::IPAddress address, std::shared_ptr<Callback> callback)
-    : address_(address), callback_(std::move(callback)) {
+HttpServer::HttpServer(td::IPAddress address, std::shared_ptr<Callback> callback, HttpBufferOptions buffer_options)
+    : address_(address), callback_(std::move(callback)), buffer_options_(buffer_options) {
 }
 
 void HttpServer::start_up() {
@@ -81,7 +81,7 @@ void HttpServer::accepted(td::SocketFd fd) {
   stats_.connections_active.add(1);
   stats_.connections.inc();
   td::actor::create_actor<HttpInboundConnection>(td::actor::ActorOptions().with_name("inhttpconn").with_poll(),
-                                                 std::move(fd), callback_)
+                                                 std::move(fd), callback_, buffer_options_)
       .release();
 }
 

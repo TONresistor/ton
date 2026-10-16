@@ -611,6 +611,11 @@ if (NOT CMAKE_CROSSCOMPILING)
 endif()
 
 #TESTS
+add_executable(test-http-payload test/test-td-main.cpp test/test-http-payload.cpp)
+target_link_libraries(test-http-payload PRIVATE tonhttp)
+add_test(NAME test-http-payload COMMAND test-http-payload)
+add_dependencies(all-tests test-http-payload)
+
 add_executable(test-ed25519 test/test-td-main.cpp ${ED25519_TEST_SOURCE})
 target_link_libraries(test-ed25519 PRIVATE ton_crypto)
 

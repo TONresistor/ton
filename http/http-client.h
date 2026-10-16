@@ -45,10 +45,10 @@ class HttpClient : public td::actor::Actor {
       td::Promise<std::pair<std::unique_ptr<HttpResponse>, std::shared_ptr<HttpPayload>>> promise) = 0;
 
   static td::actor::ActorOwn<HttpClient> create(std::string domain, td::IPAddress addr,
-                                                std::shared_ptr<Callback> callback);
+                                                std::shared_ptr<Callback> callback, HttpBufferOptions buffer_options = {});
   static td::actor::ActorOwn<HttpClient> create_multi(std::string domain, td::IPAddress addr,
                                                       td::uint32 max_connections, td::uint32 max_requests_per_connect,
-                                                      std::shared_ptr<Callback> callback);
+                                                      std::shared_ptr<Callback> callback, HttpBufferOptions buffer_options = {});
 };
 
 }  // namespace http

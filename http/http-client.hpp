@@ -29,8 +29,9 @@ namespace http {
 
 class HttpClientImpl : public HttpClient {
  public:
-  HttpClientImpl(std::string domain, td::IPAddress addr, std::shared_ptr<Callback> callback)
-      : domain_(std::move(domain)), addr_(addr), callback_(std::move(callback)) {
+  HttpClientImpl(std::string domain, td::IPAddress addr, std::shared_ptr<Callback> callback,
+                 HttpBufferOptions buffer_options = {})
+      : domain_(std::move(domain)), addr_(addr), callback_(std::move(callback)), buffer_options_(buffer_options) {
   }
 
   void start_up() override {
@@ -80,18 +81,21 @@ class HttpClientImpl : public HttpClient {
   td::Timestamp next_create_at_;
 
   std::shared_ptr<Callback> callback_;
+  HttpBufferOptions buffer_options_;
   td::actor::ActorOwn<HttpOutboundConnection> conn_;
 };
 
 class HttpMultiClientImpl : public HttpClient {
  public:
   HttpMultiClientImpl(std::string domain, td::IPAddress addr, td::uint32 max_connections,
-                      td::uint32 max_requests_per_connect, std::shared_ptr<Callback> callback)
+                      td::uint32 max_requests_per_connect, std::shared_ptr<Callback> callback,
+                      HttpBufferOptions buffer_options = {})
       : domain_(std::move(domain))
       , addr_(addr)
       , max_connections_(max_connections)
       , max_requests_per_connect_(max_requests_per_connect)
-      , callback_(std::move(callback)) {
+      , callback_(std::move(callback))
+      , buffer_options_(buffer_options) {
   }
 
   void start_up() override {
@@ -115,6 +119,7 @@ class HttpMultiClientImpl : public HttpClient {
   td::Timestamp next_create_at_;
 
   std::shared_ptr<Callback> callback_;
+  HttpBufferOptions buffer_options_;
 };
 
 }  // namespace http

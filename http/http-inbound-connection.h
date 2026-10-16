@@ -28,8 +28,9 @@ namespace http {
 
 class HttpInboundConnection : public HttpConnection {
  public:
-  HttpInboundConnection(td::SocketFd fd, std::shared_ptr<HttpServer::Callback> http_callback)
-      : HttpConnection(std::move(fd), nullptr, false), http_callback_(std::move(http_callback)) {
+  HttpInboundConnection(td::SocketFd fd, std::shared_ptr<HttpServer::Callback> http_callback,
+                        HttpBufferOptions buffer_options = {})
+      : HttpConnection(std::move(fd), nullptr, false, buffer_options), http_callback_(std::move(http_callback)) {
   }
 
   ~HttpInboundConnection() override {
@@ -65,6 +66,9 @@ class HttpInboundConnection : public HttpConnection {
 
   void payload_written() override {
     writing_payload_ = nullptr;
+    if (tunnel_write_pending_) {
+      return;
+    }
     if (!close_after_write_) {
       read_next_request_ = true;
       if (found_eof_) {
@@ -76,6 +80,9 @@ class HttpInboundConnection : public HttpConnection {
   void payload_read() override {
     reading_payload_ = nullptr;
     read_next_request_ = false;
+    if (tunnel_write_closed_) {
+      stop();
+    }
   }
 
   td::Status receive(td::ChainBufferReader &input) override;

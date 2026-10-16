@@ -39,8 +39,14 @@ class HttpConnection : public td::actor::Actor, public td::ObserverBase {
     virtual void on_ready(td::actor::ActorId<HttpConnection> conn) = 0;
   };
 
-  HttpConnection(td::SocketFd fd, std::unique_ptr<Callback> callback, bool is_client)
-      : buffered_fd_(std::move(fd)), callback_(std::move(callback)), is_client_(is_client) {
+  HttpConnection(td::SocketFd fd, std::unique_ptr<Callback> callback, bool is_client,
+                 HttpBufferOptions buffer_options = {})
+      : buffered_fd_(std::move(fd))
+      , callback_(std::move(callback))
+      , is_client_(is_client)
+      , buffer_options_(buffer_options) {
+    CHECK(buffer_options_.connection_high_watermark > 0);
+    CHECK(buffer_options_.payload_high_watermark > 0);
   }
   virtual td::Status receive(td::ChainBufferReader &input) = 0;
   virtual td::Status receive_eof() = 0;
@@ -83,9 +89,14 @@ class HttpConnection : public td::actor::Actor, public td::ObserverBase {
   bool sent_ready_ = false;
 
   bool is_client_;
+  HttpBufferOptions buffer_options_;
   bool close_after_write_ = false;
   bool close_after_read_ = false;
   bool found_eof_ = false;
+  bool tunnel_mode_ = false;
+  bool tunnel_read_eof_ = false;
+  bool tunnel_write_pending_ = false;
+  bool tunnel_write_closed_ = false;
   bool in_loop_ = false;
   bool allow_read_ = true;
 
@@ -112,8 +123,8 @@ class HttpConnection : public td::actor::Actor, public td::ObserverBase {
   static constexpr size_t fd_low_watermark() {
     return 1 << 14;
   }
-  static constexpr size_t fd_high_watermark() {
-    return 1 << 16;
+  size_t fd_high_watermark() const {
+    return buffer_options_.connection_high_watermark;
   }
   static constexpr size_t chunk_size() {
     return 1 << 10;
@@ -124,6 +135,12 @@ class HttpConnection : public td::actor::Actor, public td::ObserverBase {
   }
 
   void tear_down() override {
+    if (reading_payload_ && !reading_payload_->parse_completed()) {
+      reading_payload_->set_error();
+    }
+    if (writing_payload_ && !writing_payload_->written()) {
+      writing_payload_->set_error();
+    }
     if (callback_) {
       callback_->on_close(actor_id(this));
       callback_ = nullptr;

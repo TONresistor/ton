@@ -58,7 +58,8 @@ void HttpClientImpl::create_connection() {
     td::actor::ActorId<HttpClientImpl> id_;
   };
   conn_ = td::actor::create_actor<HttpOutboundConnection>(td::actor::ActorOptions().with_name("outconn").with_poll(),
-                                                          fd.move_as_ok(), std::make_shared<Cb>(actor_id(this)));
+                                                          fd.move_as_ok(), std::make_shared<Cb>(actor_id(this)),
+                                                          buffer_options_);
 }
 
 void HttpClientImpl::send_request(
@@ -99,7 +100,7 @@ void HttpMultiClientImpl::send_request(
   };
   auto conn =
       td::actor::create_actor<HttpOutboundConnection>(td::actor::ActorOptions().with_name("outconn").with_poll(),
-                                                      fd.move_as_ok(), std::make_shared<Cb>(actor_id(this)))
+                                                      fd.move_as_ok(), std::make_shared<Cb>(actor_id(this)), buffer_options_)
           .release();
   request->set_keep_alive(false);
   td::actor::send_closure(conn, &HttpOutboundConnection::send_query, std::move(request), std::move(payload), timeout,
@@ -107,16 +108,18 @@ void HttpMultiClientImpl::send_request(
 }
 
 td::actor::ActorOwn<HttpClient> HttpClient::create(std::string domain, td::IPAddress addr,
-                                                   std::shared_ptr<HttpClient::Callback> callback) {
-  return td::actor::create_actor<HttpClientImpl>("httpclient", std::move(domain), addr, std::move(callback));
+                                                   std::shared_ptr<HttpClient::Callback> callback,
+                                                   HttpBufferOptions buffer_options) {
+  return td::actor::create_actor<HttpClientImpl>("httpclient", std::move(domain), addr, std::move(callback), buffer_options);
 }
 
 td::actor::ActorOwn<HttpClient> HttpClient::create_multi(std::string domain, td::IPAddress addr,
                                                          td::uint32 max_connections,
                                                          td::uint32 max_requests_per_connect,
-                                                         std::shared_ptr<Callback> callback) {
+                                                         std::shared_ptr<Callback> callback,
+                                                         HttpBufferOptions buffer_options) {
   return td::actor::create_actor<HttpMultiClientImpl>("httpmclient", std::move(domain), addr, max_connections,
-                                                      max_requests_per_connect, std::move(callback));
+                                                      max_requests_per_connect, std::move(callback), buffer_options);
 }
 
 }  // namespace http

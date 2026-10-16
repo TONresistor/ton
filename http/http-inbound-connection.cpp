@@ -86,7 +86,7 @@ td::Status HttpInboundConnection::receive(td::ChainBufferReader &input) {
     }
   }
 
-  auto payload = cur_request_->create_empty_payload().move_as_ok();
+  auto payload = cur_request_->create_empty_payload(buffer_options_.payload_high_watermark).move_as_ok();
   auto P = td::PromiseCreator::lambda(
       [SelfId = actor_id(this)](td::Result<std::pair<std::unique_ptr<HttpResponse>, std::shared_ptr<HttpPayload>>> R) {
         if (R.is_ok()) {

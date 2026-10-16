@@ -165,18 +165,18 @@ td::Status HttpRequest::complete_parse_header() {
   return td::Status::OK();
 }
 
-td::Result<std::shared_ptr<HttpPayload>> HttpRequest::create_empty_payload() {
+td::Result<std::shared_ptr<HttpPayload>> HttpRequest::create_empty_payload(size_t buffer_high_watermark) {
   CHECK(check_parse_header_completed());
 
   if (!need_payload()) {
     return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_empty);
   } else if (method_ == "CONNECT") {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_tunnel, low_watermark(), high_watermark());
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_tunnel, low_watermark(), buffer_high_watermark);
   } else if (found_content_length_) {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_content_length, low_watermark(), high_watermark(),
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_content_length, low_watermark(), buffer_high_watermark,
                                          content_length_);
   } else if (found_transfer_encoding_) {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_chunked, low_watermark(), high_watermark());
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_chunked, low_watermark(), buffer_high_watermark);
   } else {
     return td::Status::Error("expected Content-Length/Transfer-Encoding header");
   }
@@ -260,7 +260,9 @@ tl_object_ptr<ton_api::http_request> HttpRequest::store_tl(td::Bits256 req_id) {
 td::Status HttpPayload::parse(td::ChainBufferReader &input) {
   CHECK(!parse_completed());
   while (true) {
-    if (high_watermark_reached()) {
+    if (high_watermark_reached() &&
+        !(type_ == PayloadType::pt_content_length && state_ == ParseState::reading_chunk_data &&
+          cur_chunk_size_ == 0)) {
       return td::Status::OK();
     }
     switch (state_) {
@@ -473,7 +475,9 @@ HttpHeader HttpPayload::get_header() {
 
 void HttpPayload::run_callbacks() {
   for (auto &x : callbacks_) {
-    if (state_.load(std::memory_order_relaxed) == ParseState::completed) {
+    if (error_) {
+      x->failed();
+    } else if (state_.load(std::memory_order_relaxed) == ParseState::completed) {
       x->completed();
     } else {
       x->run(ready_bytes_);
@@ -599,6 +603,7 @@ tl_object_ptr<ton_api::http_payloadPart> HttpPayload::store_tl(size_t max_size) 
     max_size -= s.size();
   }
   obj->data_.truncate(obj->data_.size() - S.size());
+  slice_gc();
   auto cur_state = state_.load(std::memory_order_consume);
   if (chunks_.size() != 0 || (cur_state != ParseState::reading_trailer && cur_state != ParseState::completed)) {
     return obj;
@@ -712,6 +717,9 @@ tl_object_ptr<ton_api::http_PayloadInfo> HttpPayload::store_info(size_t max_size
 
 void HttpPayload::add_callback(std::unique_ptr<HttpPayload::Callback> callback) {
   const std::lock_guard<std::mutex> lock{mutex_};
+  if (error_) {
+    callback->failed();
+  }
   callbacks_.push_back(std::move(callback));
 }
 
@@ -791,20 +799,20 @@ bool HttpResponse::check_parse_header_completed() const {
   return parse_header_completed_;
 }
 
-td::Result<std::shared_ptr<HttpPayload>> HttpResponse::create_empty_payload() {
+td::Result<std::shared_ptr<HttpPayload>> HttpResponse::create_empty_payload(size_t buffer_high_watermark) {
   CHECK(check_parse_header_completed());
 
   if (!need_payload()) {
     return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_empty);
   } else if (is_tunnel_) {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_tunnel, low_watermark(), high_watermark());
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_tunnel, low_watermark(), buffer_high_watermark);
   } else if (found_content_length_) {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_content_length, low_watermark(), high_watermark(),
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_content_length, low_watermark(), buffer_high_watermark,
                                          content_length_);
   } else if (found_transfer_encoding_) {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_chunked, low_watermark(), high_watermark());
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_chunked, low_watermark(), buffer_high_watermark);
   } else {
-    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_eof, low_watermark(), high_watermark());
+    return std::make_shared<HttpPayload>(HttpPayload::PayloadType::pt_eof, low_watermark(), buffer_high_watermark);
   }
 }
 
@@ -877,7 +885,7 @@ tl_object_ptr<ton_api::http_response> HttpResponse::store_tl() {
   } else {
     headers.push_back(HttpHeader{"Connection", "Close"}.store_tl());
   }
-  return create_tl_object<ton_api::http_response>(proto_version_, code_, reason_, std::move(headers), false);
+  return create_tl_object<ton_api::http_response>(proto_version_, code_, reason_, std::move(headers), !need_payload());
 }
 
 td::Status HttpHeader::basic_check() {

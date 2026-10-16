@@ -31,6 +31,11 @@ namespace ton {
 
 namespace http {
 
+struct HttpBufferOptions {
+  size_t connection_high_watermark = 1 << 16;
+  size_t payload_high_watermark = 1 << 17;
+};
+
 enum HttpStatusCode : td::uint32 {
   status_ok = 200,
   status_bad_request = 400,
@@ -101,6 +106,9 @@ class HttpPayload {
    public:
     virtual void run(size_t ready_bytes) = 0;
     virtual void completed() = 0;
+    virtual void failed() {
+      completed();
+    }
     virtual void flush() {
     }
     virtual ~Callback() = default;
@@ -130,7 +138,10 @@ class HttpPayload {
     return error_;
   }
   void set_error() {
-    error_ = true;
+    const std::lock_guard<std::mutex> lock{mutex_};
+    if (!error_.exchange(true)) {
+      run_callbacks();
+    }
   }
   PayloadType payload_type() const {
     return type_;
@@ -218,7 +229,7 @@ class HttpRequest {
 
   td::Status complete_parse_header();
   td::Status add_header(HttpHeader header);
-  td::Result<std::shared_ptr<HttpPayload>> create_empty_payload();
+  td::Result<std::shared_ptr<HttpPayload>> create_empty_payload(size_t buffer_high_watermark = high_watermark());
   bool need_payload() const;
 
   const auto &method() const {
@@ -299,7 +310,7 @@ class HttpResponse {
 
   td::Status complete_parse_header();
   td::Status add_header(HttpHeader header);
-  td::Result<std::shared_ptr<HttpPayload>> create_empty_payload();
+  td::Result<std::shared_ptr<HttpPayload>> create_empty_payload(size_t buffer_high_watermark = high_watermark());
   bool need_payload() const;
 
   auto code() const {
