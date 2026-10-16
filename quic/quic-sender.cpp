@@ -391,6 +391,14 @@ td::actor::Task<> QuicSender::add_id_and_wait(adnl::AdnlNodeIdShort local_id) {
   return add_local_id_coro(local_id);
 }
 
+td::actor::Task<> QuicSender::add_client_id_and_wait(adnl::AdnlNodeIdShort local_id) {
+  return add_local_id_coro(local_id, true);
+}
+
+void QuicSender::add_client_id(adnl::AdnlNodeIdShort local_id) {
+  add_local_id_coro(local_id, true).start().detach("add local client id");
+}
+
 void QuicSender::log_stats(std::string reason) {
   for (auto &it : servers_by_port_) {
     td::actor::send_closure(it.second.get(), &QuicServer::log_stats, reason);
@@ -562,9 +570,12 @@ td::actor::Task<std::string> QuicSender::get_conn_ip_str_coro(adnl::AdnlNodeIdSh
   co_return "<quic connection>";
 }
 
-td::actor::Task<> QuicSender::add_local_id_coro(adnl::AdnlNodeIdShort local_id) {
-  adnl::AdnlNode node = co_await td::actor::ask(adnl_, &adnl::Adnl::get_self_node, local_id);
-  auto port = (co_await get_ip_address(node)).get_port();
+td::actor::Task<> QuicSender::add_local_id_coro(adnl::AdnlNodeIdShort local_id, bool client_only) {
+  int port = 0;
+  if (!client_only) {
+    adnl::AdnlNode node = co_await td::actor::ask(adnl_, &adnl::Adnl::get_self_node, local_id);
+    port = (co_await get_ip_address(node)).get_port();
+  }
   auto priv_key = co_await td::actor::ask(keyring_, &keyring::Keyring::export_private_key, local_id.pubkey_hash());
   auto ed25519_key = co_await priv_key.export_as_ed25519();
   local_keys_.emplace(local_id, td::Ed25519::PrivateKey(ed25519_key.as_octet_string()));
@@ -604,6 +615,12 @@ td::actor::Task<> QuicSender::add_local_id_coro(adnl::AdnlNodeIdShort local_id) 
 std::shared_ptr<QuicSender::Connection> QuicSender::get_or_create_connection(AdnlPath path) {
   if (!waiter_timeouts_.empty() && waiter_timeouts_.top_key().is_in_past()) {
     alarm();
+  }
+  if (bidirectional_queries_) {
+    auto inbound = inbound_.find(path);
+    if (inbound != inbound_.end() && inbound->second->is_ready && !inbound->second->init_error) {
+      return inbound->second;
+    }
   }
   auto iter = outbound_.find(path);
   if (iter == outbound_.end()) {
@@ -854,10 +871,18 @@ void QuicSender::on_stream_complete(QuicConnectionId cid, QuicStreamID stream_id
     return;  // a legacy bidi message triggers an empty response as its confirmation
   }
 
-  // Requests are accepted only on inbound connections, answers only on outbound ones: an outbound
-  // connection carries our own queries, so a request arriving on it (or an answer on an inbound one)
-  // is misdirected.
-  if (!connection->is_outbound) {
+  bool peer_initiated = (stream_id & 1) == (connection->is_outbound ? 1 : 0);
+  if (bidirectional_queries_ && (stream_id & 2)) {
+    if (!connection->is_outbound) {
+      auto message = fetch_tl_object<ton_api::quic_message>(std::move(data), true);
+      if (message.is_ok()) {
+        on_request(std::move(connection), stream_id, *message.ok());
+      }
+    }
+    return;
+  }
+  bool is_request = bidirectional_queries_ ? peer_initiated : !connection->is_outbound;
+  if (is_request) {
     auto req_R = fetch_tl_object<ton_api::quic_Request>(data.clone(), true);
     if (req_R.is_ok()) {
       auto request = req_R.move_as_ok();
@@ -970,8 +995,24 @@ td::actor::Task<> QuicSender::on_inbound_query(std::shared_ptr<Connection> conne
                                                td::BufferSlice query) {
   auto trust = connection->trust;
   peer_metrics_.at(trust).app.record(metrics::Kind::query, metrics::Direction::in, query.as_slice());
-  auto answer = co_await td::actor::ask(adnl_, &adnl::AdnlPeerTable::deliver_query, connection->path.second,
-                                        connection->path.first, std::move(query));
+  td::Result<td::BufferSlice> result;
+  if (query_callback_) {
+    auto [task, promise] = td::actor::StartedTask<td::BufferSlice>::make_bridge();
+    query_callback_->receive_query(connection->path.second, connection->path.first, std::move(query),
+                                    std::move(promise));
+    result = co_await std::move(task).wrap();
+  } else {
+    result = co_await td::actor::ask(adnl_, &adnl::AdnlPeerTable::deliver_query, connection->path.second,
+                                     connection->path.first, std::move(query)).wrap();
+  }
+  if (result.is_error()) {
+    if (!query_callback_) {
+      co_return result.move_as_error();
+    }
+    td::actor::send_closure(connection->server, &QuicServer::shutdown_stream, connection->cid, stream_id);
+    co_return td::Unit{};
+  }
+  auto answer = result.move_as_ok();
   peer_metrics_.at(trust).app.record(metrics::Kind::answer, metrics::Direction::out, answer.as_slice());
   td::BufferSlice wire_data = create_serialize_tl_object<ton_api::quic_answer>(std::move(answer));
   td::actor::send_closure(connection->server, &QuicServer::send_stream, connection->cid, stream_id,

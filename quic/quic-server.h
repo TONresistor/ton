@@ -76,6 +76,9 @@ class QuicServer : public td::actor::Actor, public td::ObserverBase {
     bool message_streams_bidi = false;
     // RFC 9221 DATAGRAM frame size; 0 keeps messages on streams.
     td::uint32 max_datagram_frame_size = 0;
+    size_t max_burst = 16;
+    td::uint32 socket_send_buffer = 0;
+    td::uint32 socket_receive_buffer = 0;
   };
   class Callback {
    public:
@@ -178,7 +181,7 @@ class QuicServer : public td::actor::Actor, public td::ObserverBase {
   class PImplCallback;
 
   constexpr static size_t DEFAULT_MTU = 1350;
-  constexpr static size_t kMaxBurst = 16;
+  constexpr static size_t kMaxBurstLimit = 32;
   constexpr static size_t kIngressBatch = 16;
   constexpr static size_t kEgressBatch = 16;
   constexpr static size_t kMaxDatagram = 64 * 1024;
@@ -284,7 +287,7 @@ class QuicServer : public td::actor::Actor, public td::ObserverBase {
   std::array<td::Status, kIngressBatch> ingress_errors_;
 
   // Pre-allocated egress buffers
-  std::array<std::array<char, DEFAULT_MTU * kMaxBurst>, kEgressBatch> egress_buffers_;
+  std::array<std::vector<char>, kEgressBatch> egress_buffers_;
   std::array<UdpMessageBuffer, kEgressBatch> egress_batches_;
   std::array<std::shared_ptr<ConnectionState>, kEgressBatch> egress_message_owners_;
   std::array<td::UdpSocketFd::OutboundMessage, kEgressBatch> egress_messages_;
