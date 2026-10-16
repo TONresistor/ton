@@ -661,6 +661,36 @@ endif()
 
 #BEGIN internal
 if (NOT TON_ONLY_TONLIB)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND AND USE_QUIC)
+  add_executable(test-proxy-dht-fixture test/net/proxy-dht-fixture.cpp)
+  target_link_libraries(test-proxy-dht-fixture PRIVATE dht adnl keyring tl_api tdactor tdutils)
+  add_executable(test-proxy-quic-probe test/net/proxy-quic-probe.cpp)
+  target_link_libraries(test-proxy-quic-probe PRIVATE quic tl_api)
+  add_test(NAME test-http-proxy COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/integration/test_http_proxy.py
+    --proxy $<TARGET_FILE:rldp-http-proxy>
+    --key-helper $<TARGET_FILE:generate-random-id>
+    --dht-server $<TARGET_FILE:test-proxy-dht-fixture>
+    --dht-resolver $<TARGET_FILE:dht-resolve>
+    --quic-probe $<TARGET_FILE:test-proxy-quic-probe>)
+  set_tests_properties(test-http-proxy PROPERTIES TIMEOUT 240)
+  set(TON_HTTP_PROXY_LEGACY_BINARY "" CACHE FILEPATH "Unmodified RLDP2 proxy for compatibility tests")
+  if (TON_HTTP_PROXY_LEGACY_BINARY)
+    foreach(legacy_side client server)
+      add_test(NAME test-http-proxy-legacy-${legacy_side} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/integration/test_http_proxy.py
+        --proxy $<TARGET_FILE:rldp-http-proxy>
+        --${legacy_side}-proxy ${TON_HTTP_PROXY_LEGACY_BINARY}
+        --key-helper $<TARGET_FILE:generate-random-id>
+        --dht-server $<TARGET_FILE:test-proxy-dht-fixture>
+        --dht-resolver $<TARGET_FILE:dht-resolve>
+        --compatibility --expected-transport RLDP2)
+      set_tests_properties(test-http-proxy-legacy-${legacy_side} PROPERTIES TIMEOUT 150)
+    endforeach()
+  endif()
+  add_dependencies(all-tests rldp-http-proxy generate-random-id test-proxy-dht-fixture test-proxy-quic-probe dht-resolve)
+endif()
 add_executable(test-db test/test-td-main.cpp ${TONDB_TEST_SOURCE})
 target_link_libraries(test-db PRIVATE ton_db memprof tdfec)
 

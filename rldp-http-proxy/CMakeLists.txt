@@ -1,5 +1,11 @@
 add_executable(rldp-http-proxy rldp-http-proxy.cpp DNSResolver.h DNSResolver.cpp)
 target_include_directories(rldp-http-proxy PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
 target_link_libraries(rldp-http-proxy PRIVATE tonhttp rldp2 dht tonlib git)
+if (USE_QUIC)
+  target_link_libraries(rldp-http-proxy PRIVATE quic)
+  target_compile_definitions(rldp-http-proxy PRIVATE TON_PROXY_USE_QUIC=1)
+else()
+  target_compile_definitions(rldp-http-proxy PRIVATE TON_PROXY_USE_QUIC=0)
+endif()
 
 install(TARGETS rldp-http-proxy RUNTIME DESTINATION bin)

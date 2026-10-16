@@ -37,6 +37,9 @@
 #include "dht/dht.h"
 #include "http/http-client.h"
 #include "http/http-server.h"
+#if TON_PROXY_USE_QUIC
+#include "quic/quic-sender.h"
+#endif
 #include "rldp2/rldp.h"
 #include "td/actor/MultiPromise.h"
 #include "td/utils/BufferedFd.h"
@@ -47,6 +50,7 @@
 #include "td/utils/filesystem.h"
 #include "td/utils/port/path.h"
 #include "td/utils/port/signals.h"
+
 #include "tonlib/tonlib/TonlibClient.h"
 #include "tonlib/tonlib/TonlibClientWrapper.h"
 
@@ -56,6 +60,10 @@
 #if TD_DARWIN || TD_LINUX
 #include <unistd.h>
 #endif
+
+constexpr bool kUseQuic = TON_PROXY_USE_QUIC != 0;
+constexpr size_t kProxyPayloadHighWatermark = 1 << 20;
+constexpr ton::http::HttpBufferOptions kProxyHttpBufferOptions{1 << 20, kProxyPayloadHighWatermark};
 
 class RldpHttpProxy;
 
@@ -84,7 +92,8 @@ class HttpRemote : public td::actor::Actor {
      private:
       td::actor::ActorId<HttpRemote> id_;
     };
-    client_ = ton::http::HttpClient::create_multi("", addr_, 1000, 100, std::make_shared<Cb>(actor_id(this)));
+    client_ = ton::http::HttpClient::create_multi("", addr_, 1000, 100, std::make_shared<Cb>(actor_id(this)),
+                                                      kProxyHttpBufferOptions);
   }
   void set_ready(bool ready) {
     ready_ = ready;
@@ -134,7 +143,31 @@ const std::string PROXY_ENTRY_VERISON_HEADER_NAME = "Ton-Proxy-Entry-Version";
 const std::string PROXY_VERSION_HEADER = PSTRING() << "Commit: " << GitMetadata::CommitSHA1()
                                                    << ", Date: " << GitMetadata::CommitDate();
 const td::uint64 CAPABILITY_RLDP2 = 1;
-const td::uint64 CAPABILITIES = 1;
+const td::uint64 CAPABILITY_QUIC = 2;
+const td::uint64 CAPABILITIES = CAPABILITY_RLDP2 | (kUseQuic ? CAPABILITY_QUIC : 0);
+
+class ProxyTransportDispatcher : public td::actor::Actor {
+ public:
+  ProxyTransportDispatcher(td::actor::ActorId<ton::adnl::AdnlSenderInterface> rldp2,
+                           td::actor::ActorId<ton::adnl::AdnlSenderInterface> quic)
+      : rldp2_(rldp2), quic_(quic) {}
+
+  void select(td::uint64 capabilities,
+              td::Promise<td::actor::ActorId<ton::adnl::AdnlSenderInterface>> promise) {
+    if (!quic_.empty() && (capabilities & CAPABILITY_QUIC)) {
+      LOG(INFO) << "Selected HTTP transport: QUIC";
+      promise.set_value(td::actor::ActorId<ton::adnl::AdnlSenderInterface>{quic_});
+    } else if (capabilities & CAPABILITY_RLDP2) {
+      LOG(INFO) << "Selected HTTP transport: RLDP2";
+      promise.set_value(td::actor::ActorId<ton::adnl::AdnlSenderInterface>{rldp2_});
+    } else {
+      promise.set_error(td::Status::Error("peer supports neither RLDP2 nor compatible HTTP over QUIC"));
+    }
+  }
+
+ private:
+  td::actor::ActorId<ton::adnl::AdnlSenderInterface> rldp2_, quic_;
+};
 
 using RegisteredPayloadSenderGuard =
     std::unique_ptr<std::pair<td::actor::ActorId<RldpHttpProxy>, td::Bits256>,
@@ -170,6 +203,10 @@ class HttpRldpPayloadReceiver : public td::actor::Actor {
       }
       void completed() override {
       }
+      void failed() override {
+        td::actor::send_closure(self_id_, &HttpRldpPayloadReceiver::abort_query,
+                                td::Status::Error("HTTP consumer closed"));
+      }
 
      private:
       size_t watermark_ = watermark();
@@ -182,9 +219,17 @@ class HttpRldpPayloadReceiver : public td::actor::Actor {
   }
 
   void request_more_data() {
+    if (payload_->is_error()) {
+      stop();
+      return;
+    }
     LOG(INFO) << "HttpPayloadReceiver: sent=" << sent_ << " completed=" << payload_->parse_completed()
               << " ready=" << payload_->ready_bytes() << " watermark=" << watermark();
-    if (sent_ || payload_->parse_completed()) {
+    if (payload_->parse_completed()) {
+      stop();
+      return;
+    }
+    if (sent_) {
       return;
     }
     if (payload_->ready_bytes() >= watermark()) {
@@ -207,6 +252,10 @@ class HttpRldpPayloadReceiver : public td::actor::Actor {
   }
 
   void add_data(td::BufferSlice data) {
+    if (payload_->is_error()) {
+      stop();
+      return;
+    }
     LOG(INFO) << "HttpPayloadReceiver: received answer (size " << data.size() << ")";
     auto F = ton::fetch_tl_object<ton::ton_api::http_payloadPart>(data, true);
     if (F.is_error()) {
@@ -307,15 +356,17 @@ class HttpRldpPayloadSender : public td::actor::Actor {
     if (from_timer) {
       active_timer_ = false;
     }
+    if (payload_->is_error()) {
+      abort_query(td::Status::Error("HTTP producer closed"));
+      return;
+    }
     if (!cur_query_promise_) {
       return;
     }
-    if (payload_->is_error()) {
-      return;
-    }
-    if (payload_->parse_completed() || payload_->ready_bytes() >= ton::http::HttpRequest::low_watermark()) {
+    if (payload_->parse_completed() || payload_->ready_bytes() >= cur_query_size_) {
       answer_query();
-    } else if (!is_tunnel_ || payload_->ready_bytes() == 0) {
+    } else if (payload_->ready_bytes() == 0 ||
+               (!is_tunnel_ && payload_->ready_bytes() < ton::http::HttpRequest::low_watermark())) {
       return;
     } else if (from_timer) {
       answer_query();
@@ -388,10 +439,19 @@ class HttpRldpPayloadSender : public td::actor::Actor {
 
   void abort_query(td::Status error) {
     LOG(INFO) << error;
+    if (cur_query_promise_) {
+      cur_query_promise_.set_error(std::move(error));
+    }
     stop();
   }
 
  private:
+  void tear_down() override {
+    if (!payload_->written()) {
+      payload_->set_error();
+    }
+  }
+
   static constexpr size_t watermark() {
     return (1 << 21) - (1 << 11);
   }
@@ -437,6 +497,11 @@ class TcpToRldpRequestSender : public td::actor::Actor {
       , storage_gateway_(storage_gateway) {
   }
 
+  void selected_transport(td::actor::ActorId<ton::adnl::AdnlSenderInterface> transport) {
+    rldp_ = transport;
+    send_request();
+  }
+
   void start_up() override {
     td::Random::secure_bytes(id_.as_slice());
     request_tl_ = request_->store_tl(id_);
@@ -477,7 +542,7 @@ class TcpToRldpRequestSender : public td::actor::Actor {
       return;
     }
 
-    response_payload_ = response_->create_empty_payload().move_as_ok();
+    response_payload_ = response_->create_empty_payload(kProxyPayloadHighWatermark).move_as_ok();
 
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Unit> R) {
       if (R.is_error()) {
@@ -531,7 +596,6 @@ class TcpToRldpRequestSender : public td::actor::Actor {
   td::actor::ActorId<RldpHttpProxy> proxy_;
   td::actor::ActorId<DNSResolver> dns_resolver_;
   ton::adnl::AdnlNodeIdShort storage_gateway_ = ton::adnl::AdnlNodeIdShort::zero();
-
   bool dns_resolve_sent_ = false;
 
   std::unique_ptr<ton::http::HttpResponse> response_;
@@ -568,7 +632,7 @@ class RldpTcpTunnel : public td::actor::Actor, private td::ObserverBase {
   }
 
   void request_data() {
-    if (close_ || sent_request_) {
+    if (got_last_part_ || sent_request_) {
       return;
     }
     sent_request_ = true;
@@ -623,23 +687,37 @@ class RldpTcpTunnel : public td::actor::Actor, private td::ObserverBase {
   }
 
   void process() {
-    if (!close_) {
-      auto status = [&] {
+    auto status = [&] {
+      if (!read_closed_) {
+        if (td::can_close(fd_)) {
+          fd_.get_poll_info().clear_flags(td::PollFlags::Close());
+          fd_.get_poll_info().add_flags(td::PollFlags::Read());
+        }
         TRY_STATUS(fd_.flush_read());
-        TRY_STATUS(fd_.flush_write());
-        close_ = td::can_close(fd_);
-        return td::Status::OK();
-      }();
-      if (status.is_error()) {
-        abort(std::move(status));
-        return;
+        read_closed_ = td::can_close(fd_);
       }
-    }
-    if (got_last_part_) {
-      close_ = true;
+      if (!write_closed_) {
+        if (read_closed_ && td::can_close(fd_)) {
+          fd_.get_poll_info().clear_flags(td::PollFlags::Close());
+          fd_.get_poll_info().add_flags(td::PollFlags::Write());
+        }
+        TRY_STATUS(fd_.flush_write());
+        if (got_last_part_ && !fd_.left_unwritten()) {
+          TRY_STATUS(fd_.shutdown_write());
+          write_closed_ = true;
+        }
+      }
+      return td::Status::OK();
+    }();
+    if (status.is_error()) {
+      abort(std::move(status));
+      return;
     }
     answer_query();
     request_data();
+    if (sent_last_part_ && write_closed_) {
+      stop();
+    }
   }
 
   void answer_query(bool allow_empty = false, bool from_timer = false) {
@@ -647,8 +725,8 @@ class RldpTcpTunnel : public td::actor::Actor, private td::ObserverBase {
       active_timer_ = false;
     }
     auto &input = fd_.input_buffer();
-    if (cur_promise_ && (!input.empty() || close_ || allow_empty)) {
-      if (!from_timer && !close_ && !allow_empty && input.size() < ton::http::HttpRequest::low_watermark()) {
+    if (cur_promise_ && (!input.empty() || read_closed_ || allow_empty)) {
+      if (!from_timer && !read_closed_ && !allow_empty && input.size() < ton::http::HttpRequest::low_watermark()) {
         if (!active_timer_) {
           active_timer_ = true;
           ton::delay_action(
@@ -663,12 +741,13 @@ class RldpTcpTunnel : public td::actor::Actor, private td::ObserverBase {
       td::BufferSlice data(s);
       LOG(INFO) << "RldpTcpTunnel: sending data to rldp: size=" << data.size();
       input.advance(s, td::as_mutable_slice(data));
+      sent_last_part_ = read_closed_ && input.empty();
       cur_promise_.set_result(ton::create_serialize_tl_object<ton::ton_api::http_payloadPart>(
-          std::move(data), std::vector<ton::tl_object_ptr<ton::ton_api::http_header>>(), close_));
+          std::move(data), std::vector<ton::tl_object_ptr<ton::ton_api::http_header>>(), sent_last_part_));
       ++cur_seqno_;
       cur_promise_.reset();
       alarm_timestamp() = td::Timestamp::never();
-      if (close_) {
+      if (sent_last_part_ && write_closed_) {
         stop();
         return;
       }
@@ -716,7 +795,8 @@ class RldpTcpTunnel : public td::actor::Actor, private td::ObserverBase {
   td::int32 cur_seqno_ = 0, cur_max_chunk_size_ = 0;
   td::Promise<td::BufferSlice> cur_promise_;
   td::int32 out_seqno_ = 0;
-  bool close_ = false, sent_request_ = false, got_last_part_ = false;
+  bool read_closed_ = false, write_closed_ = false, sent_last_part_ = false;
+  bool sent_request_ = false, got_last_part_ = false;
   bool active_timer_ = false;
 };
 
@@ -758,9 +838,11 @@ class RldpToTcpRequestSender : public td::actor::Actor {
   }
 
   void got_result(std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>> R) {
-    td::actor::create_actor<HttpRldpPayloadSender>("HttpPayloadSender(R)", std::move(R.second), id_, local_id_, adnl_,
-                                                   rldp_, proxy_)
-        .release();
+    if (R.first->need_payload()) {
+      td::actor::create_actor<HttpRldpPayloadSender>("HttpPayloadSender(R)", std::move(R.second), id_, local_id_, adnl_,
+                                                     rldp_, proxy_)
+          .release();
+    }
     R.first->add_header({PROXY_SITE_VERISON_HEADER_NAME, PROXY_VERSION_HEADER});
     auto f = ton::serialize_tl_object(R.first->store_tl(), true);
     promise_.set_value(std::move(f));
@@ -899,6 +981,9 @@ class RldpHttpProxy : public td::actor::Actor {
   }
 
   void run_cont() {
+    if (use_quic_ && !is_client_ && (addr_.get_port() < 1 || addr_.get_port() > 64535)) {
+      LOG(FATAL) << "Server ADNL port must be between 1 and 64535; QUIC uses ADNL port + 1000";
+    }
     if (is_client_ && hosts_.size() > 0) {
       LOG(ERROR) << "client-only node cannot be server";
       std::_Exit(2);
@@ -977,7 +1062,10 @@ class RldpHttpProxy : public td::actor::Actor {
         td::actor::ActorId<RldpHttpProxy> proxy_;
       };
 
-      server_ = ton::http::HttpServer::create(port_, std::make_shared<Cb>(actor_id(this)));
+      td::IPAddress http_address;
+      http_address.init_ipv4_port(td::CSlice(is_client_ ? "127.0.0.1" : "0.0.0.0"), port_).ensure();
+      server_ = td::actor::create_actor<ton::http::HttpServer>(
+          "httpserver", http_address, std::make_shared<Cb>(actor_id(this)), kProxyHttpBufferOptions);
     }
 
     class AdnlPayloadCb : public ton::adnl::Adnl::Callback {
@@ -998,7 +1086,8 @@ class RldpHttpProxy : public td::actor::Actor {
     };
     class AdnlCapabilitiesCb : public ton::adnl::Adnl::Callback {
      public:
-      AdnlCapabilitiesCb(td::actor::ActorId<RldpHttpProxy> id) : self_id_(id) {
+      AdnlCapabilitiesCb(td::actor::ActorId<RldpHttpProxy> id, td::uint64 capabilities)
+          : self_id_(id), capabilities_(capabilities) {
       }
       void receive_message(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst,
                            td::BufferSlice data) override {
@@ -1006,12 +1095,13 @@ class RldpHttpProxy : public td::actor::Actor {
       void receive_query(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst, td::BufferSlice data,
                          td::Promise<td::BufferSlice> promise) override {
         TRY_RESULT_PROMISE(promise, query, ton::fetch_tl_object<ton::ton_api::http_proxy_getCapabilities>(data, true));
-        promise.set_result(ton::create_serialize_tl_object<ton::ton_api::http_proxy_capabilities>(CAPABILITIES));
-        td::actor::send_closure(self_id_, &RldpHttpProxy::update_peer_capabilities, src, query->capabilities_);
+        td::actor::send_closure(self_id_, &RldpHttpProxy::receive_peer_capabilities, src, query->capabilities_,
+                                capabilities_, std::move(promise));
       }
 
      private:
       td::actor::ActorId<RldpHttpProxy> self_id_;
+      td::uint64 capabilities_;
     };
     class AdnlServerCb : public ton::adnl::Adnl::Callback {
      public:
@@ -1039,7 +1129,7 @@ class RldpHttpProxy : public td::actor::Actor {
                                 std::make_unique<AdnlPayloadCb>(actor_id(this)));
         td::actor::send_closure(adnl_, &ton::adnl::Adnl::subscribe, serv_id,
                                 ton::adnl::Adnl::int_to_bytestring(ton::ton_api::http_proxy_getCapabilities::ID),
-                                std::make_unique<AdnlCapabilitiesCb>(actor_id(this)));
+                                std::make_unique<AdnlCapabilitiesCb>(actor_id(this), CAPABILITIES));
       }
     }
     td::actor::send_closure(adnl_, &ton::adnl::Adnl::subscribe, local_id_,
@@ -1047,14 +1137,53 @@ class RldpHttpProxy : public td::actor::Actor {
                             std::make_unique<AdnlPayloadCb>(actor_id(this)));
     td::actor::send_closure(adnl_, &ton::adnl::Adnl::subscribe, local_id_,
                             ton::adnl::Adnl::int_to_bytestring(ton::ton_api::http_proxy_getCapabilities::ID),
-                            std::make_unique<AdnlCapabilitiesCb>(actor_id(this)));
+                            std::make_unique<AdnlCapabilitiesCb>(actor_id(this), CAPABILITIES));
 
-    rldp2_ = ton::rldp2::Rldp::create(adnl_.get());
-    td::actor::send_closure(rldp2_, &ton::rldp2::Rldp::set_default_mtu, 16 << 10);
-    td::actor::send_closure(rldp2_, &ton::rldp2::Rldp::add_id, local_id_);
-    for (auto &serv_id : server_ids_) {
-      td::actor::send_closure(rldp2_, &ton::rldp2::Rldp::add_id, serv_id);
+#if TON_PROXY_USE_QUIC
+    if (use_quic_) {
+      ton::quic::QuicServer::Options options;
+      options.max_burst = 32;
+      options.socket_send_buffer = 1 << 20;
+      options.socket_receive_buffer = 4 << 20;
+      auto quic = td::actor::create_actor<ton::quic::QuicSender>(
+          "quic", td::actor::actor_dynamic_cast<ton::adnl::AdnlPeerTable>(adnl_.get()), keyring_.get(), options);
+      class QuicQueryCb : public ton::adnl::Adnl::Callback {
+       public:
+        explicit QuicQueryCb(td::actor::ActorId<RldpHttpProxy> proxy) : proxy_(proxy) {}
+        void receive_query(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst,
+                           td::BufferSlice data, td::Promise<td::BufferSlice> promise) override {
+          td::actor::send_closure(proxy_, &RldpHttpProxy::receive_quic_query, src, dst,
+                                  std::move(data), std::move(promise));
+        }
+       private:
+        td::actor::ActorId<RldpHttpProxy> proxy_;
+      };
+      td::actor::send_closure(quic, &ton::quic::QuicSender::set_query_callback,
+                              std::make_unique<QuicQueryCb>(actor_id(this)));
+      td::actor::send_closure(quic, &ton::quic::QuicSender::enable_bidirectional_queries);
+      td::actor::send_closure(quic, &ton::adnl::AdnlSenderEx::set_default_mtu, 16 << 10);
+      if (is_client_) {
+        td::actor::send_closure(quic, &ton::quic::QuicSender::add_client_id, local_id_);
+      } else {
+        td::actor::send_closure(quic, &ton::quic::QuicSender::add_id, local_id_);
+        for (auto serv_id : server_ids_) {
+          if (serv_id != local_id_) {
+            td::actor::send_closure(quic, &ton::quic::QuicSender::add_id, serv_id);
+          }
+        }
+      }
+      quic_ = std::move(quic);
     }
+#endif
+    rldp2_ = ton::rldp2::Rldp::create(adnl_.get());
+    td::actor::send_closure(rldp2_, &ton::adnl::AdnlSenderEx::set_default_mtu, 16 << 10);
+    td::actor::send_closure(rldp2_, &ton::adnl::AdnlSenderEx::add_id, local_id_);
+    for (auto serv_id : server_ids_) {
+      if (serv_id != local_id_) {
+        td::actor::send_closure(rldp2_, &ton::adnl::AdnlSenderEx::add_id, serv_id);
+      }
+    }
+    sender_ = td::actor::create_actor<ProxyTransportDispatcher>("http-transport", rldp2_.get(), quic_.get());
   }
 
   void receive_http_request(
@@ -1110,7 +1239,27 @@ class RldpHttpProxy : public td::actor::Actor {
 
   void receive_rldp_request(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst, td::BufferSlice data,
                             td::Promise<td::BufferSlice> promise) {
-    LOG(INFO) << "got HTTP request over rldp from " << src;
+    receive_http_transport_request(src, dst, std::move(data), rldp2_.get(), std::move(promise));
+  }
+
+  void receive_quic_query(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst,
+                          td::BufferSlice data, td::Promise<td::BufferSlice> promise) {
+    if (ton::fetch_tl_object<ton::ton_api::http_request>(data.clone(), true).is_ok()) {
+      receive_http_transport_request(src, dst, std::move(data), quic_.get(), std::move(promise));
+    } else {
+      receive_payload_part_request(std::move(data), std::move(promise));
+    }
+  }
+
+  void receive_http_transport_request(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst,
+                                      td::BufferSlice data,
+                                      td::actor::ActorId<ton::adnl::AdnlSenderInterface> transport,
+                                      td::Promise<td::BufferSlice> promise) {
+    if (!server_ids_.count(dst)) {
+      promise.set_error(td::Status::Error("HTTP requests are not accepted for this identity"));
+      return;
+    }
+    LOG(INFO) << "got HTTP request using " << (transport == quic_.get() ? "QUIC" : "RLDP2") << " from " << src;
     TRY_RESULT_PROMISE(promise, f, ton::fetch_tl_object<ton::ton_api::http_request>(data, true));
     std::unique_ptr<ton::http::HttpRequest> request;
     auto S = [&]() {
@@ -1182,8 +1331,8 @@ class RldpHttpProxy : public td::actor::Actor {
     }
     auto &server = it2->second;
     if (request->method() == "CONNECT") {
-      LOG(INFO) << "starting HTTP tunnel over RLDP to " << server.remote_addr_;
-      start_tcp_tunnel(f->id_, src, dst, f->http_version_, server.remote_addr_, std::move(promise));
+      LOG(INFO) << "starting HTTP tunnel over " << (transport == quic_.get() ? "QUIC" : "RLDP2") << " to " << server.remote_addr_;
+      start_tcp_tunnel(f->id_, src, dst, f->http_version_, server.remote_addr_, transport, std::move(promise));
       return;
     }
 
@@ -1191,28 +1340,30 @@ class RldpHttpProxy : public td::actor::Actor {
       server.http_remote_ = td::actor::create_actor<HttpRemote>("remote", server.remote_addr_);
     }
 
-    auto payload = request->create_empty_payload();
+    auto payload = request->create_empty_payload(kProxyPayloadHighWatermark);
     if (payload.is_error()) {
       promise.set_result(create_error_response(f->http_version_, 502, "Bad Gateway"));
       return;
     }
 
-    LOG(INFO) << "starting HTTP over RLDP request";
+    LOG(INFO) << "starting HTTP over " << (transport == quic_.get() ? "QUIC" : "RLDP2") << " request";
     td::actor::create_actor<RldpToTcpRequestSender>("inboundreq", f->id_, dst, src, std::move(request),
-                                                    payload.move_as_ok(), std::move(promise), adnl_.get(), rldp2_.get(),
+                                                    payload.move_as_ok(), std::move(promise), adnl_.get(), transport,
                                                     actor_id(this), server.http_remote_.get())
         .release();
   }
 
   void start_tcp_tunnel(td::Bits256 id, ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort local_id,
-                        std::string http_version, td::IPAddress ip, td::Promise<td::BufferSlice> promise) {
+                        std::string http_version, td::IPAddress ip,
+                        td::actor::ActorId<ton::adnl::AdnlSenderInterface> transport,
+                        td::Promise<td::BufferSlice> promise) {
     auto fd = td::SocketFd::open(ip);
     if (fd.is_error()) {
       promise.set_result(create_error_response(http_version, 502, "Bad Gateway"));
       return;
     }
     td::actor::create_actor<RldpTcpTunnel>(td::actor::ActorOptions().with_name("tunnel").with_poll(), id, src, local_id,
-                                           adnl_.get(), rldp2_.get(), actor_id(this), fd.move_as_ok())
+                                           adnl_.get(), transport, actor_id(this), fd.move_as_ok())
         .release();
     std::vector<ton::tl_object_ptr<ton::ton_api::http_header>> headers;
     headers.push_back(
@@ -1276,6 +1427,21 @@ class RldpHttpProxy : public td::actor::Actor {
     storage_gateway_ = id;
   }
 
+  void receive_peer_capabilities(ton::adnl::AdnlNodeIdShort peer, td::uint64 capabilities,
+                                 td::uint64 local_capabilities, td::Promise<td::BufferSlice> promise) {
+    update_peer_capabilities(peer, capabilities);
+    promise.set_result(ton::create_serialize_tl_object<ton::ton_api::http_proxy_capabilities>(local_capabilities));
+  }
+
+  void select_peer_transport(ton::adnl::AdnlNodeIdShort peer,
+                            td::Promise<td::actor::ActorId<ton::adnl::AdnlSenderInterface>> promise) {
+    get_peer_capabilities(peer, [dispatcher = sender_.get(), promise = std::move(promise)](
+                                  td::Result<td::uint64> result) mutable {
+      TRY_RESULT_PROMISE(promise, capabilities, std::move(result));
+      td::actor::send_closure(dispatcher, &ProxyTransportDispatcher::select, capabilities, std::move(promise));
+    });
+  }
+
   void update_peer_capabilities(ton::adnl::AdnlNodeIdShort peer, td::uint64 capabilities) {
     td::uint64 &c = peer_capabilities_.get(peer);
     if (c != capabilities) {
@@ -1332,12 +1498,14 @@ class RldpHttpProxy : public td::actor::Actor {
   td::actor::ActorOwn<ton::adnl::AdnlNetworkManager> adnl_network_manager_;
   td::actor::ActorOwn<ton::adnl::Adnl> adnl_;
   td::actor::ActorOwn<ton::dht::Dht> dht_;
-  td::actor::ActorOwn<ton::rldp2::Rldp> rldp2_;
+  td::actor::ActorOwn<ton::adnl::AdnlSenderEx> rldp2_, quic_;
+  td::actor::ActorOwn<ProxyTransportDispatcher> sender_;
 
   std::shared_ptr<ton::dht::DhtGlobalConfig> dht_config_;
 
   std::string db_root_ = ".";
   bool proxy_all_ = false;
+  bool use_quic_ = kUseQuic;
 
   td::actor::ActorOwn<tonlib::TonlibClientWrapper> tonlib_client_;
   td::actor::ActorOwn<DNSResolver> dns_resolver_;
@@ -1407,20 +1575,15 @@ void TcpToRldpRequestSender::resolve(std::string host) {
 
 void TcpToRldpRequestSender::resolved(ton::adnl::AdnlNodeIdShort id) {
   dst_ = id;
-  td::actor::send_closure(proxy_, &RldpHttpProxy::get_peer_capabilities, id,
-                          [SelfId = actor_id(this)](td::Result<td::uint64> R) {
-                            if (R.is_error()) {
-                              td::actor::send_closure(SelfId, &TcpToRldpRequestSender::abort_query,
-                                                      R.move_as_error_prefix("failed to fetch peer capabilities: "));
-                              return;
-                            }
-                            if (!(R.move_as_ok() & CAPABILITY_RLDP2)) {
-                              td::actor::send_closure(SelfId, &TcpToRldpRequestSender::abort_query,
-                                                      td::Status::Error("peer does not support RLDP2"));
-                              return;
-                            }
-                            td::actor::send_closure(SelfId, &TcpToRldpRequestSender::send_request);
-                          });
+  td::actor::send_closure(proxy_, &RldpHttpProxy::select_peer_transport, id,
+      [SelfId = actor_id(this)](td::Result<td::actor::ActorId<ton::adnl::AdnlSenderInterface>> result) {
+        if (result.is_error()) {
+          td::actor::send_closure(SelfId, &TcpToRldpRequestSender::abort_query,
+                                  result.move_as_error_prefix("failed to select peer transport: "));
+        } else {
+          td::actor::send_closure(SelfId, &TcpToRldpRequestSender::selected_transport, result.move_as_ok());
+        }
+      });
 }
 
 void TcpToRldpRequestSender::send_request() {
@@ -1552,6 +1715,15 @@ int main(int argc, char *argv[]) {
   };
 
   td::OptionParser p;
+#if TON_PROXY_USE_QUIC
+  p.set_description(
+      "A simple HTTP proxy for TON sites; prefers QUIC with RLDP2 compatibility\n"
+      "Example:\n\trldp-http-proxy -p 8080 -c 3333 -C ton-global.config.json\tRuns a local HTTP->QUIC proxy that "
+      "accepts HTTP proxy queries at localhost:8080\n"
+      "Example:\n\trldp-http-proxy -a <global-ip>:3333 -L example.ton -C ton-global.config.json\tRuns a local "
+      "QUIC->HTTP proxy (ADNL UDP :3333, QUIC UDP :4333) that forwards queries for http://example.ton to HTTP server "
+      "at localhost:80\n");
+#else
   p.set_description(
       "A simple rldp-to-http and http-to-rldp proxy for running and accessing ton sites\n"
       "Example:\n\trldp-http-proxy -p 8080 -c 3333 -C ton-global.config.json\tRuns a local HTTP->RLDP proxy that "
@@ -1559,6 +1731,7 @@ int main(int argc, char *argv[]) {
       "Example:\n\trldp-http-proxy -a <global-ip>:3333 -L example.ton -C ton-global.config.json\tRuns a local "
       "RLDP->HTTP proxy on UDP port <global-ip>:3333 that forwards all queries for http://example.ton to HTTP server "
       "at localhost:80\n");
+#endif
   p.add_option('v', "verbosity", "set verbosity level", [&](td::Slice arg) {
     int v = VERBOSITY_NAME(FATAL) + (td::to_integer<int>(arg));
     SET_VERBOSITY_LEVEL(v);
@@ -1580,7 +1753,7 @@ int main(int argc, char *argv[]) {
     td::actor::send_closure(x, &RldpHttpProxy::set_port, port);
     return td::Status::OK();
   });
-  p.add_checked_option('a', "address", "local <ip>:<port> to use for adnl queries", [&](td::Slice arg) -> td::Status {
+  p.add_checked_option('a', "address", "local <ip>:<port> for ADNL/RLDP2; QUIC builds also listen at <port> + 1000", [&](td::Slice arg) -> td::Status {
     td::IPAddress addr;
     TRY_STATUS(addr.init_host_port(arg.str()));
     td::actor::send_closure(x, &RldpHttpProxy::set_addr, addr);
