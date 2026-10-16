@@ -17,6 +17,8 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "adnl/adnl-network-manager.h"
 #include "adnl/adnl-node-id.hpp"
@@ -171,6 +173,20 @@ class EchoCallback : public ton::adnl::Adnl::Callback {
   }
 };
 
+class CountingEchoCallback : public ton::adnl::Adnl::Callback {
+ public:
+  explicit CountingEchoCallback(std::shared_ptr<std::atomic<int>> calls) : calls_(std::move(calls)) {}
+
+  void receive_query(ton::adnl::AdnlNodeIdShort, ton::adnl::AdnlNodeIdShort, td::BufferSlice data,
+                     td::Promise<td::BufferSlice> promise) override {
+    calls_->fetch_add(1);
+    promise.set_value(std::move(data));
+  }
+
+ private:
+  std::shared_ptr<std::atomic<int>> calls_;
+};
+
 class DelayedResponse : public td::actor::Actor {
  public:
   DelayedResponse(double delay, td::BufferSlice data, td::Promise<td::BufferSlice> promise)
@@ -301,7 +317,8 @@ class TestRunner : public td::actor::Actor {
 
   td::actor::Task<TestNode> create_node(std::string name, int port, std::optional<ton::PrivateKey> key = std::nullopt,
                                         std::string ip = "127.0.0.1",
-                                        ton::quic::QuicServer::Options options = quic_test_options()) {
+                                        ton::quic::QuicServer::Options options = quic_test_options(),
+                                        bool client_only = false, bool bidirectional = false) {
     TestNode node;
     node.ip = ip;
     node.port = port;
@@ -328,6 +345,11 @@ class TestRunner : public td::actor::Actor {
     co_await td::actor::ask(node.keyring, &ton::keyring::Keyring::add_key, node.key, true);
 
     auto addr_list = make_addr_list(ip, port);
+    if (client_only) {
+      addr_list = ton::adnl::AdnlAddressList{};
+      addr_list.set_version(static_cast<td::int32>(td::Clocks::system()));
+      addr_list.set_reinit_date(ton::adnl::Adnl::adnl_start_time());
+    }
     td::actor::send_closure(node.adnl, &ton::adnl::Adnl::add_id,
                             ton::adnl::AdnlNodeIdFull{node.key.compute_public_key()}, addr_list, td::uint8(0));
 
@@ -341,7 +363,14 @@ class TestRunner : public td::actor::Actor {
         "quic-" + name, td::actor::actor_dynamic_cast<ton::adnl::AdnlPeerTable>(node.adnl.get()), node.keyring.get(),
         options);
 
-    co_await td::actor::ask(node.quic_sender, &ton::quic::QuicSender::add_id_and_wait, node.id);
+    if (bidirectional || client_only) {
+      td::actor::send_closure(node.quic_sender, &ton::quic::QuicSender::enable_bidirectional_queries);
+    }
+    if (client_only) {
+      co_await td::actor::ask(node.quic_sender, &ton::quic::QuicSender::add_client_id_and_wait, node.id);
+    } else {
+      co_await td::actor::ask(node.quic_sender, &ton::quic::QuicSender::add_id_and_wait, node.id);
+    }
     co_return std::move(node);
   }
 
@@ -359,6 +388,16 @@ class TestRunner : public td::actor::Actor {
   void set_never_respond(TestNode& node) {
     td::actor::send_closure(node.adnl, &ton::adnl::Adnl::subscribe, node.id, "X",
                             std::make_unique<NeverRespondCallback>());
+  }
+
+  void set_limited_echo(TestNode& node, bool application_handler, td::uint64 max_query_size) {
+    if (application_handler) {
+      td::actor::send_closure(node.quic_sender, &ton::quic::QuicSender::set_query_callback,
+                              std::make_unique<LimitedEchoCallback>(max_query_size));
+    } else {
+      td::actor::send_closure(node.adnl, &ton::adnl::Adnl::subscribe, node.id, "E",
+                              std::make_unique<LimitedEchoCallback>(max_query_size));
+    }
   }
 
   void set_static_response(TestNode& node, std::string prefix, std::string response) {
@@ -500,6 +539,65 @@ ton::quic::QuicServer::Options small_stream_limit_options(size_t max_streams_bid
 }
 
 struct RawQuicEndpointState {
+  void set_reply(std::string wire) {
+    std::lock_guard guard(mutex);
+    reply = std::move(wire);
+    auto_reply = true;
+  }
+
+  void hold_replies() {
+    std::lock_guard guard(mutex);
+    auto_reply = false;
+  }
+
+  std::optional<std::string> get_reply() const {
+    std::lock_guard guard(mutex);
+    if (!auto_reply) {
+      return std::nullopt;
+    }
+    return reply;
+  }
+
+  void set_greeting(std::string wire) {
+    std::lock_guard guard(mutex);
+    greeting = std::move(wire);
+  }
+
+  std::string get_greeting() const {
+    std::lock_guard guard(mutex);
+    return greeting;
+  }
+
+  void remember_stream_data(ton::quic::QuicStreamID sid, td::Slice data, bool is_end) {
+    std::lock_guard guard(mutex);
+    auto &buffer = received[sid];
+    if (!data.empty()) {
+      buffer.append(data.data(), data.size());
+    }
+    if (is_end) {
+      completed_streams.insert(sid);
+      latest_completed_stream = sid;
+    }
+  }
+
+  std::optional<std::string> completed_data(ton::quic::QuicStreamID sid) const {
+    std::lock_guard guard(mutex);
+    if (!completed_streams.contains(sid)) {
+      return std::nullopt;
+    }
+    return received.at(sid);
+  }
+
+  size_t completed_count() const {
+    std::lock_guard guard(mutex);
+    return completed_streams.size();
+  }
+
+  std::optional<ton::quic::QuicStreamID> last_completed_stream() const {
+    std::lock_guard guard(mutex);
+    return latest_completed_stream;
+  }
+
   void remember_connection(ton::quic::QuicConnectionId cid, bool is_outbound, std::string local_public_key) {
     std::lock_guard guard(mutex);
     if (is_outbound) {
@@ -658,6 +756,12 @@ struct RawQuicEndpointState {
   td::HashSet<ton::quic::QuicStreamID> closed_streams;
   size_t closed_stream_count = 0;
   size_t local_closed_stream_count = 0;
+  std::string reply;
+  bool auto_reply = true;
+  std::string greeting;
+  std::unordered_map<ton::quic::QuicStreamID, std::string> received;
+  std::unordered_set<ton::quic::QuicStreamID> completed_streams;
+  std::optional<ton::quic::QuicStreamID> latest_completed_stream;
 
  private:
   bool hold_peer_streams_ = false;
@@ -681,6 +785,11 @@ class RawQuicCallback final : public ton::quic::QuicServer::Callback {
   td::Status on_connected(ton::quic::QuicConnectionId cid, td::SecureString local_public_key, td::SecureString,
                           bool is_outbound) override {
     state_->remember_connection(cid, is_outbound, local_public_key.as_slice().str());
+    auto greeting = state_->get_greeting();
+    if (!greeting.empty()) {
+      td::actor::send_closure(server_, &ton::quic::QuicServer::send_stream, cid,
+                              ton::quic::StreamOptions{}, td::BufferSlice(greeting), true);
+    }
     return td::Status::OK();
   }
 
@@ -692,6 +801,7 @@ class RawQuicCallback final : public ton::quic::QuicServer::Callback {
     if (!data.empty()) {
       state_->remember_stream_data(sid);
     }
+    state_->remember_stream_data(sid, data.as_slice(), is_end);
     if (!is_end || state_->is_local_stream(sid)) {
       return td::Status::OK();
     }
@@ -699,7 +809,11 @@ class RawQuicCallback final : public ton::quic::QuicServer::Callback {
     // Nothing can be written back on a stream the peer opened one-way; its credit comes back through
     // release_peer_uni_stream_credit() instead, from on_stream_closed below.
     if (ngtcp2_is_bidi_stream(sid)) {
-      td::actor::send_closure(server_, &ton::quic::QuicServer::send_stream_end, cid, sid);
+      auto reply = state_->get_reply();
+      if (reply) {
+        td::actor::send_closure(server_, &ton::quic::QuicServer::send_stream, cid, sid,
+                                td::BufferSlice(*reply), true);
+      }
     }
     return td::Status::OK();
   }
@@ -755,7 +869,9 @@ class RawQuicTestRunner final : public td::actor::Actor {
     LOG(FATAL) << "Test timeout after " << timeout_ << "s";
   }
 
-  static td::actor::Task<RawQuicEndpoint> create_endpoint(ton::quic::QuicServer::Options options) {
+  static td::actor::Task<RawQuicEndpoint> create_endpoint(
+      ton::quic::QuicServer::Options options,
+      std::optional<ton::adnl::AdnlNodeIdShort> advertised_identity = std::nullopt) {
     auto port = next_port();
     auto key = make_quic_key(port);
     auto state = std::make_shared<RawQuicEndpointState>();
@@ -764,7 +880,8 @@ class RawQuicTestRunner final : public td::actor::Actor {
     auto* callback_ptr = callback.get();
     auto local_id = ton::adnl::AdnlNodeIdFull(ton::PublicKey(ton::pubkeys::Ed25519(key.get_public_key().move_as_ok())))
                         .compute_short_id();
-    auto identity = ton::quic::ServerIdentity{.local_id = local_id, .key = clone_quic_key(key)};
+    auto identity = ton::quic::ServerIdentity{.local_id = advertised_identity.value_or(local_id),
+                                               .key = clone_quic_key(key)};
     auto server_result = ton::quic::QuicServer::create(port, std::move(callback), 4096, std::move(identity), "ton",
                                                        "127.0.0.1", options);
     ASSERT_TRUE(server_result.is_ok());
@@ -894,6 +1011,35 @@ void run_raw_quic_test(RawQuicTestRunner::TestFunc test) {
   scheduler.run();
 }
 
+td::actor::Task<td::BufferSlice> query_peer(TestNode& from, ton::adnl::AdnlNodeIdShort peer,
+                                             td::Slice data, double timeout) {
+  auto [task, promise] = td::actor::StartedTask<td::BufferSlice>::make_bridge();
+  td::actor::send_closure(from.quic_sender, &ton::quic::QuicSender::send_query_ex, from.id, peer,
+                          std::string("rejection test"), std::move(promise), td::Timestamp::in(timeout),
+                          td::BufferSlice(data), 4096);
+  co_return co_await std::move(task);
+}
+
+std::shared_ptr<std::atomic<int>> count_application_queries(TestNode& node, bool application_handler) {
+  auto calls = std::make_shared<std::atomic<int>>(0);
+  td::actor::send_closure(node.adnl, &ton::adnl::Adnl::subscribe, node.id, "E",
+                          std::make_unique<CountingEchoCallback>(calls));
+  if (application_handler) {
+    td::actor::send_closure(node.quic_sender, &ton::quic::QuicSender::set_query_callback,
+                            std::make_unique<CountingEchoCallback>(calls));
+  }
+  return calls;
+}
+
+td::actor::Task<ton::quic::QuicStreamID> send_raw_query_stream(
+    RawQuicEndpoint& endpoint, ton::quic::QuicConnectionId cid, td::BufferSlice wire) {
+  auto sid = co_await td::actor::ask(endpoint.server, &ton::quic::QuicServer::open_stream, cid,
+                                     ton::quic::StreamOptions{});
+  endpoint.state->remember_local_stream(sid);
+  co_await td::actor::ask(endpoint.server, &ton::quic::QuicServer::send_stream, cid, sid, std::move(wire), true);
+  co_return sid;
+}
+
 void jump_time_to(double at, double epsilon = 0.00) {
   td::Time::jump_in_future(at + epsilon);
 }
@@ -918,6 +1064,179 @@ void assert_metric(const std::string& metrics, td::Slice sample, td::uint64 valu
 }
 
 }  // namespace
+
+TEST(QuicSender, OutboundOnlyClientBidirectionalQueries) {
+  for (auto max_burst : {size_t{16}, size_t{32}}) {
+    run_test([max_burst](TestRunner& t) -> td::actor::Task<td::Unit> {
+      auto options = quic_test_options();
+      options.max_burst = max_burst;
+      auto client = co_await t.create_node("client", next_port(), std::nullopt, "127.0.0.1", options, true, false);
+      auto server = co_await t.create_node("server", next_port(), std::nullopt, "127.0.0.1", options, false, true);
+      t.add_peer(client, server);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.1));
+      auto self = co_await td::actor::ask(client.adnl, &ton::adnl::Adnl::get_self_node, client.id);
+      ASSERT_TRUE(self.addr_list().adnl_addrs().empty());
+      ASSERT_TRUE(self.addr_list().quic_addrs().empty());
+
+      auto request = co_await t.send_query(client, server, "request");
+      ASSERT_EQ(request.as_slice(), td::Slice("Qrequest"));
+      std::string payload(128 * 1024, 'p');
+      td::actor::send_closure(client.quic_sender, &ton::adnl::AdnlSenderEx::set_default_mtu, 256 * 1024);
+      auto response = co_await t.send_query_ex(server, client, payload, 10.0, 256 * 1024);
+      ASSERT_EQ(response.as_slice().substr(1), td::Slice(payload));
+      t.set_static_response(client, "R", std::string(1024, 'r'));
+      auto oversized = co_await t.send_prefixed_query_ex(server, client, "R", "", 5.0, 512).wrap();
+      ASSERT_TRUE(oversized.is_error());
+      auto next = co_await t.send_query(client, server, "next");
+      ASSERT_EQ(next.as_slice(), td::Slice("Qnext"));
+      co_return td::Unit{};
+    });
+  }
+}
+
+TEST(QuicServer, CompatibilityOptions) {
+  ton::quic::QuicServer::Options options{false, false, false, ton::quic::CongestionControlAlgo::Bbr};
+  ASSERT_TRUE(!options.enable_gso && !options.enable_gro && !options.enable_mmsg);
+  ASSERT_EQ(options.max_burst, 16u);
+  ASSERT_EQ(options.socket_send_buffer, 0u);
+  ASSERT_EQ(options.socket_receive_buffer, 0u);
+}
+
+TEST(QuicSender, BidirectionalRejectsWrongPeerIdentity) {
+  for (bool bidirectional : {false, true}) {
+    run_test([bidirectional](TestRunner& t) -> td::actor::Task<td::Unit> {
+      auto client = co_await t.create_node("identity-client", next_port(), std::nullopt, "127.0.0.1",
+                                            quic_test_options(), bidirectional, bidirectional);
+      auto calls = count_application_queries(client, bidirectional);
+      auto expected_key = make_key(next_port());
+      auto expected_id = ton::adnl::AdnlNodeIdShort{expected_key.compute_public_key().compute_short_id()};
+      auto impostor = co_await RawQuicTestRunner::create_endpoint(quic_test_options(), expected_id);
+      auto attack = ton::create_serialize_tl_object<ton::ton_api::quic_query>(td::BufferSlice("Ebefore-auth"));
+      impostor.state->set_greeting(attack.as_slice().str());
+      auto spoof = ton::create_serialize_tl_object<ton::ton_api::quic_answer>(td::BufferSlice("spoof"));
+      impostor.state->set_reply(spoof.as_slice().str());
+      auto wrong_address = make_addr_list("127.0.0.1", impostor.port - 1000);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.1));
+      td::actor::send_closure(client.adnl, &ton::adnl::Adnl::add_peer, client.id,
+                              ton::adnl::AdnlNodeIdFull{expected_key.compute_public_key()}, wrong_address);
+      auto rejected = co_await query_peer(client, expected_id, "Qidentity", 3.0).wrap();
+      ASSERT_TRUE(rejected.is_error());
+      ASSERT_TRUE(rejected.error().message().str().find("Key mismatch") != std::string::npos);
+      ASSERT_EQ(calls->load(), 0);
+      ASSERT_EQ(impostor.state->completed_count(), 0u);
+
+      auto server = co_await t.create_node("identity-server", next_port(), expected_key, "127.0.0.1",
+                                            quic_test_options(), false, bidirectional);
+      auto correct_address = make_addr_list("127.0.0.1", server.port);
+      correct_address.set_version(wrong_address.version() + 1);
+      td::actor::send_closure(client.adnl, &ton::adnl::Adnl::add_peer, client.id,
+                              ton::adnl::AdnlNodeIdFull{expected_key.compute_public_key()}, correct_address);
+      co_await td::actor::ask(client.adnl, &ton::adnl::Adnl::get_peer_node, client.id, expected_id);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.1));
+      auto response = co_await query_peer(client, expected_id, "Qafter-rejection", 5.0);
+      ASSERT_EQ(response.as_slice(), td::Slice("Qafter-rejection"));
+      ASSERT_EQ(calls->load(), 0);
+      co_return td::Unit{};
+    });
+  }
+}
+
+TEST(QuicSender, BidirectionalRejectsMisdirectedTraffic) {
+  for (auto [bidirectional, inbound_connection] :
+       {std::pair{false, false}, std::pair{true, false}, std::pair{true, true}}) {
+    run_test([bidirectional, inbound_connection](TestRunner& t) -> td::actor::Task<td::Unit> {
+      auto client = co_await t.create_node("direction-client", next_port(), std::nullopt, "127.0.0.1",
+                                            quic_test_options(), bidirectional && !inbound_connection, bidirectional);
+      auto calls = count_application_queries(client, bidirectional);
+      auto peer = co_await RawQuicTestRunner::create_endpoint(quic_test_options());
+      auto peer_key = ton::PublicKey{ton::pubkeys::Ed25519{peer.key.get_public_key().move_as_ok()}};
+      auto peer_id = ton::adnl::AdnlNodeIdShort{peer_key.compute_short_id()};
+      td::actor::send_closure(client.adnl, &ton::adnl::Adnl::add_peer, client.id,
+                              ton::adnl::AdnlNodeIdFull{peer_key}, make_addr_list("127.0.0.1", peer.port - 1000));
+      auto wrong_reply = ton::create_serialize_tl_object<ton::ton_api::quic_query>(td::BufferSlice("Ewrong-stream"));
+      peer.state->set_reply(wrong_reply.as_slice().str());
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.1));
+      if (inbound_connection) {
+        auto sni = ton::quic::ServerIdentity::sni(client.id);
+        auto cid = co_await td::actor::ask(peer.server, &ton::quic::QuicServer::connect,
+            td::Slice("127.0.0.1"), client.port + 1000, clone_quic_key(peer.key), td::Slice("ton"), td::Slice(sni));
+        co_await t.wait_until([&] { return peer.state->get_outbound_cid().has_value(); }, 3.0);
+        auto ready = co_await send_raw_query_stream(peer, cid,
+            ton::create_serialize_tl_object<ton::ton_api::quic_query>(td::BufferSlice("Eready")));
+        co_await t.wait_until([&] { return peer.state->completed_data(ready).has_value(); }, 3.0);
+        calls->store(0);
+      }
+      auto wrong_result = co_await query_peer(client, peer_id, "Qrequest", 1.0).wrap();
+      ASSERT_TRUE(wrong_result.is_error());
+      ASSERT_EQ(calls->load(), 0);
+      peer.state->hold_replies();
+      auto before = peer.state->completed_count();
+      auto pending = query_peer(client, peer_id, "Qpending", 3.0).start();
+      co_await t.wait_until([&] { return peer.state->completed_count() > before; }, 3.0);
+      auto pending_sid = *peer.state->last_completed_stream();
+      auto cid = inbound_connection ? *peer.state->get_outbound_cid() : *peer.state->get_inbound_cid();
+      co_await send_raw_query_stream(peer, cid,
+          ton::create_serialize_tl_object<ton::ton_api::quic_answer>(td::BufferSlice("unsolicited")));
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+      ASSERT_TRUE(!pending.await_ready());
+      co_await td::actor::ask(peer.server, &ton::quic::QuicServer::send_stream, cid, pending_sid,
+          ton::create_serialize_tl_object<ton::ton_api::quic_answer>(td::BufferSlice("matched")), true);
+      auto matched = co_await std::move(pending);
+      ASSERT_EQ(matched.as_slice(), td::Slice("matched"));
+      ASSERT_EQ(calls->load(), 0);
+
+      auto reverse_sid = co_await send_raw_query_stream(peer, cid,
+          ton::create_serialize_tl_object<ton::ton_api::quic_query>(td::BufferSlice("Ereverse")));
+      if (bidirectional) {
+        co_await t.wait_until([&] { return peer.state->completed_data(reverse_sid).has_value(); }, 3.0);
+        auto wire = *peer.state->completed_data(reverse_sid);
+        auto answer = ton::fetch_tl_object<ton::ton_api::quic_answer>(td::BufferSlice(wire), true).move_as_ok();
+        ASSERT_EQ(answer->data_.as_slice(), td::Slice("Ereverse"));
+      } else {
+        co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+        ASSERT_TRUE(!peer.state->completed_data(reverse_sid).has_value());
+      }
+      ASSERT_EQ(calls->load(), bidirectional ? 1 : 0);
+      auto good_reply = ton::create_serialize_tl_object<ton::ton_api::quic_answer>(td::BufferSlice("valid"));
+      peer.state->set_reply(good_reply.as_slice().str());
+      auto next = co_await query_peer(client, peer_id, "Qafter-rejection", 5.0);
+      ASSERT_EQ(next.as_slice(), td::Slice("valid"));
+      ASSERT_EQ(calls->load(), bidirectional ? 1 : 0);
+      co_return td::Unit{};
+    });
+  }
+}
+
+TEST(QuicSender, CompatibilityApplicationErrors) {
+  for (bool application_handler : {false, true}) {
+    run_test([application_handler](TestRunner& t) -> td::actor::Task<td::Unit> {
+      auto a = co_await t.create_node("error-a", next_port());
+      auto b = co_await t.create_node("error-b", next_port());
+      t.add_peer(a, b);
+      t.set_limited_echo(b, application_handler, 128);
+
+      auto warmup = co_await t.send_query(a, b, "warmup");
+      ASSERT_EQ(warmup.as_slice(), td::Slice("Qwarmup"));
+
+      auto start = td::Timestamp::now();
+      auto result = co_await t.send_prefixed_query_ex(a, b, "E", std::string(512, 'e'),
+                                                       application_handler ? 5.0 : 1.0, 1024).wrap();
+      auto elapsed = td::Timestamp::now().at() - start.at();
+      ASSERT_TRUE(result.is_error());
+      auto timed_out = result.error().message().str().find("timeout") != std::string::npos;
+      if (application_handler) {
+        ASSERT_TRUE(!timed_out);
+        ASSERT_TRUE(elapsed < 4.0);
+      } else {
+        ASSERT_TRUE(timed_out);
+        ASSERT_TRUE(elapsed >= 0.8);
+      }
+      auto next = co_await t.send_query(a, b, "after-error");
+      ASSERT_EQ(next.as_slice(), td::Slice("Qafter-error"));
+      co_return td::Unit{};
+    });
+  }
+}
 
 TEST(QuicSender, BasicQuery) {
   run_test([](TestRunner& t) -> td::actor::Task<td::Unit> {
@@ -1919,21 +2238,23 @@ TEST(QuicMessageStreams, PeerWithoutUniCreditGetsBidirectionalMessage) {
 // The both-new case, stated as the peer refusing everything else: with no bidirectional credit at
 // all, a message can only arrive on a unidirectional stream.
 TEST(QuicMessageStreams, PeerWithUniCreditGetsUnidirectionalMessage) {
-  run_test([](TestRunner& t) -> td::actor::Task<td::Unit> {
-    auto uni_only = quic_test_options();
-    uni_only.max_streams_bidi = 0;
+  for (bool bidirectional : {false, true}) {
+    run_test([bidirectional](TestRunner& t) -> td::actor::Task<td::Unit> {
+      auto uni_only = quic_test_options();
+      uni_only.max_streams_bidi = 0;
 
-    auto a = co_await t.create_node("uninew-a", next_port());
-    auto b = co_await t.create_node("uninew-b", next_port(), std::nullopt, "127.0.0.1", uni_only);
+      auto a = co_await t.create_node("uninew-a", next_port());
+      auto b = co_await t.create_node("uninew-b", next_port(), std::nullopt, "127.0.0.1", uni_only, false, bidirectional);
 
-    t.add_peer(a, b);
-    t.add_peer(b, a);
+      t.add_peer(a, b);
+      t.add_peer(b, a);
 
-    t.send_message(a, b, "uni");
-    co_await t.wait_until([&] { return b.received_messages->size() == 1; }, 30.0);
+      t.send_message(a, b, "uni");
+      co_await t.wait_until([&] { return b.received_messages->size() == 1; }, 30.0);
 
-    co_return td::Unit{};
-  });
+      co_return td::Unit{};
+    });
+  }
 }
 
 TEST(QuicMessageStreams, ConfirmationDistinguishesAckFromReset) {

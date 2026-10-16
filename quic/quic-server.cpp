@@ -33,6 +33,9 @@ td::Result<td::actor::ActorOwn<QuicServer>> QuicServer::create(int port, std::un
                                                                td::uint64 default_mtu, ServerIdentity identity,
                                                                td::Slice alpn, td::Slice bind_host, Options options) {
   CHECK(callback);
+  if (options.max_burst == 0 || options.max_burst > kMaxBurstLimit) {
+    return td::Status::Error("QUIC max_burst must be between 1 and 32 packets");
+  }
   td::IPAddress local_addr;
   TRY_STATUS(local_addr.init_host_port(bind_host.str(), port));
 
@@ -68,8 +71,8 @@ QuicServer::QuicServer(td::UdpSocketFd fd, td::uint64 default_mtu, ServerIdentit
     }
     return static_cast<td::uint64>(0);
   });
-  auto rcv_buffer = fd_.maximize_rcv_buffer();
-  auto snd_buffer = fd_.maximize_snd_buffer();
+  auto rcv_buffer = fd_.maximize_rcv_buffer(options.socket_receive_buffer);
+  auto snd_buffer = fd_.maximize_snd_buffer(options.socket_send_buffer);
   LOG(INFO) << "UDP buffers: rcv=" << (rcv_buffer.is_ok() ? rcv_buffer.move_as_ok() : 0)
             << " snd=" << (snd_buffer.is_ok() ? snd_buffer.move_as_ok() : 0);
 
@@ -90,8 +93,11 @@ QuicServer::QuicServer(td::UdpSocketFd fd, td::uint64 default_mtu, ServerIdentit
             << " MMSG=" << (fd_.is_mmsg_enabled() ? "on" : "off") << " CC=" << options_.cc_algo
             << " Retry=" << (options_.stateless_retry ? "on" : "off");
 
-  const size_t ingress_buf_size = gro_enabled_ ? kMaxDatagram : DEFAULT_MTU * kMaxBurst;
+  const size_t ingress_buf_size = gro_enabled_ ? kMaxDatagram : DEFAULT_MTU * options_.max_burst;
   ingress_buffers_.resize(kIngressBatch * ingress_buf_size);
+  for (auto &buffer : egress_buffers_) {
+    buffer.resize(DEFAULT_MTU * options_.max_burst);
+  }
 }
 
 void QuicServer::start_up() {
@@ -816,7 +822,7 @@ void QuicServer::drain_ingress() {
     return;
   }
   td::PerfWarningTimer w("drain_ingress", 0.1);
-  const size_t buf_size = gro_enabled_ ? kMaxDatagram : DEFAULT_MTU * kMaxBurst;
+  const size_t buf_size = gro_enabled_ ? kMaxDatagram : DEFAULT_MTU * options_.max_burst;
 
   std::vector<td::BufferSlice> ingress_data_buffers;  // for Windows receive_messages
   td::int64 bytes_budget = 10 << 20;                  // 10MB
@@ -964,7 +970,7 @@ bool QuicServer::flush_pending() {
 
 size_t QuicServer::produce_next_egress(size_t first_message) {
   CHECK(first_message < kEgressBatch);
-  const size_t max_packets = gso_enabled_ ? kMaxBurst : kEgressBatch - first_message;
+  const size_t max_packets = gso_enabled_ ? options_.max_burst : kEgressBatch - first_message;
   while (!active_connections_.empty()) {
     auto cid = active_connections_.front();
     active_connections_.pop_front();
